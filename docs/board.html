@@ -1,0 +1,59 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+  body { margin:0; background:#0f0f14; padding:34px; font-family:'SF Mono','Menlo','Monaco','Consolas',monospace; }
+  .term { width:980px; background:#1b1b23; border-radius:11px; box-shadow:0 24px 70px rgba(0,0,0,.55);
+          overflow:hidden; border:1px solid #2c2c38; }
+  .bar { display:flex; align-items:center; height:36px; background:#23232e; border-bottom:1px solid #2c2c38; position:relative; }
+  .dots { display:flex; gap:8px; padding-left:15px; }
+  .dots i { width:12px; height:12px; border-radius:50%; display:inline-block; }
+  .r{background:#ff5f56}.y{background:#ffbd2e}.g{background:#27c93f}
+  .ttl { position:absolute; left:0; right:0; text-align:center; color:#6272a4; font-size:12px; letter-spacing:.3px; }
+  .body { padding:14px 20px 20px; font-size:13.5px; line-height:1.6; color:#c5c8c6; }
+  .l { white-space:pre; }
+  .run{color:#50fa7b;font-weight:700} .wai{color:#f1fa8c;font-weight:700}
+  .ext{color:#61afef;font-weight:700} .don{color:#56b6c2;font-weight:700}
+  .dim{color:#6272a4} .nd{color:#f1fa8c} .ok{color:#50fa7b} .pend{color:#6272a4}
+  .sel{background:#e4e4e7;color:#1b1b23;border-radius:3px;display:block}
+  .lab{color:#6272a4}
+  b{color:#f8f8f2}
+</style></head>
+<body>
+<div class="term">
+  <div class="bar"><div class="dots"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+    <div class="ttl">cw — claudemux</div></div>
+  <div class="body">
+
+<div class="l"><b>claudemux</b> <span class="dim">│</span> RUNNING:1  WAITING:2  EXTERNAL:3  DONE:2  <span class="dim">│ ↑↓ move  ⏎ switch  n new  i import  r refresh  q quit</span></div>
+<div class="l"> </div>
+
+<div class="l"><span class="run">── RUNNING (1) ──</span></div>
+<div class="l sel">▸ <span style="color:#27ae60">●</span> web-app          refactor auth flow           <span class="ok">☑ 2/3</span>   3m </div>
+<div class="l"> </div>
+
+<div class="l"><span class="wai">── WAITING (needs you) (2) ──</span></div>
+<div class="l">  <span class="wai">?</span> api-server       deploy to staging                      2m</div>
+<div class="l">       <span class="nd">needs:</span> confirm rollback before deploy?</div>
+<div class="l">  <span class="wai">?</span> docs-site        add API reference                     5m</div>
+<div class="l">       <span class="nd">needs:</span> which version — v1 or v2?</div>
+<div class="l"> </div>
+
+<div class="l"><span class="ext">── EXTERNAL (importable) (3) ──</span></div>
+<div class="l">  <span class="wai">○</span> mobile-app       fix push notifications               12m</div>
+<div class="l">  <span class="wai">○</span> ml-pipeline      retrain ranking model                 1h</div>
+<div class="l">  <span class="ok">●</span> cli-tool         add --verbose flag                   30s</div>
+<div class="l"> </div>
+
+<div class="l"><span class="don">── DONE (2) ──</span></div>
+<div class="l">  <span class="don">✓</span> web-app          write unit tests                      1h</div>
+<div class="l">  <span class="don">✓</span> scripts          cleanup old backups                   3h</div>
+<div class="l"> </div>
+
+<div class="l"><span class="dim">──────────────────────────────────────────────────────────────────────────────</span></div>
+<div class="l"><span class="lab">task </span> refactor auth flow — extract AuthProvider, add tests</div>
+<div class="l"><span class="lab">todos</span> <span class="ok">☑ Refactor AuthProvider</span>  <span class="dim">·</span>  <span class="ok">☑ Add unit tests</span>  <span class="dim">·</span>  <span class="pend">☐ Update docs</span></div>
+<div class="l"><span class="lab">cwd  </span> ~/projects/web-app     <span class="lab">branch</span> feat/auth-refactor</div>
+
+  </div>
+</div>
+</body></html>

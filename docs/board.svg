@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="560" viewBox="0 0 1080 560" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace">
+  <rect x="0" y="0" width="1080" height="560" fill="#0f0f14"/>
+  <defs>
+    <clipPath id="card"><rect x="24" y="24" width="1032" height="512" rx="12"/></clipPath>
+  </defs>
+  <g clip-path="url(#card)">
+    <rect x="24" y="24" width="1032" height="512" fill="#1b1b23"/>
+    <rect x="24" y="24" width="1032" height="38" fill="#23232e"/>
+    <circle cx="50" cy="43" r="6" fill="#ff5f56"/>
+    <circle cx="68" cy="43" r="6" fill="#ffbd2e"/>
+    <circle cx="86" cy="43" r="6" fill="#27c93f"/>
+    <text x="540" y="47" text-anchor="middle" font-size="12" fill="#6272a4">cw — claudemux</text>
+
+    <text x="52" y="92" xml:space="preserve" font-size="14"><tspan font-weight="700" fill="#f8f8f2">claudemux</tspan><tspan fill="#6272a4"> │ </tspan><tspan fill="#c5c8c6">RUNNING:1  WAITING:2  EXTERNAL:3  DONE:2  </tspan><tspan fill="#6272a4">│ ↑↓ move  ⏎ switch  n new  i import  r refresh  q quit</tspan></text>
+
+    <text x="52" y="116" xml:space="preserve" font-size="14" font-weight="700" fill="#50fa7b">── RUNNING (1) ──</text>
+
+    <rect x="44" y="128" width="992" height="24" rx="3" fill="#e4e4e7"/>
+    <text x="52" y="145" xml:space="preserve" font-size="14" fill="#1b1b23">▸ <tspan fill="#27ae60">●</tspan> web-app          refactor auth flow           <tspan fill="#27ae60">☑ 2/3</tspan>   3m</text>
+
+    <text x="52" y="170" xml:space="preserve" font-size="14" font-weight="700" fill="#f1fa8c">── WAITING (needs you) (2) ──</text>
+    <text x="52" y="192" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#f1fa8c">?</tspan> api-server       deploy to staging                      2m</text>
+    <text x="52" y="210" xml:space="preserve" font-size="14" fill="#c5c8c6">       <tspan fill="#f1fa8c">needs:</tspan> confirm rollback before deploy?</text>
+    <text x="52" y="228" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#f1fa8c">?</tspan> docs-site        add API reference                     5m</text>
+    <text x="52" y="246" xml:space="preserve" font-size="14" fill="#c5c8c6">       <tspan fill="#f1fa8c">needs:</tspan> which version — v1 or v2?</text>
+
+    <text x="52" y="270" xml:space="preserve" font-size="14" font-weight="700" fill="#61afef">── EXTERNAL (importable) (3) ──</text>
+    <text x="52" y="292" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#f1fa8c">○</tspan> mobile-app       fix push notifications               12m</text>
+    <text x="52" y="310" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#f1fa8c">○</tspan> ml-pipeline      retrain ranking model                 1h</text>
+    <text x="52" y="328" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#50fa7b">●</tspan> cli-tool         add --verbose flag                   30s</text>
+
+    <text x="52" y="352" xml:space="preserve" font-size="14" font-weight="700" fill="#56b6c2">── DONE (2) ──</text>
+    <text x="52" y="374" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#56b6c2">✓</tspan> web-app          write unit tests                      1h</text>
+    <text x="52" y="392" xml:space="preserve" font-size="14" fill="#c5c8c6">  <tspan fill="#56b6c2">✓</tspan> scripts          cleanup old backups                   3h</text>
+
+    <line x1="52" y1="412" x2="1028" y2="412" stroke="#2c2c38" stroke-width="1"/>
+    <text x="52" y="434" xml:space="preserve" font-size="14"><tspan fill="#6272a4">task   </tspan><tspan fill="#c5c8c6">refactor auth flow — extract AuthProvider, add tests</tspan></text>
+    <text x="52" y="452" xml:space="preserve" font-size="14"><tspan fill="#6272a4">todos  </tspan><tspan fill="#50fa7b">☑ Refactor AuthProvider</tspan><tspan fill="#6272a4">  ·  </tspan><tspan fill="#50fa7b">☑ Add unit tests</tspan><tspan fill="#6272a4">  ·  </tspan><tspan fill="#6272a4">☐ Update docs</tspan></text>
+    <text x="52" y="470" xml:space="preserve" font-size="14"><tspan fill="#6272a4">cwd    </tspan><tspan fill="#c5c8c6">~/projects/web-app     </tspan><tspan fill="#6272a4">branch  </tspan><tspan fill="#c5c8c6">feat/auth-refactor</tspan></text>
+  </g>
+  <rect x="24" y="24" width="1032" height="512" rx="12" fill="none" stroke="#2c2c38" stroke-width="1"/>
+</svg>
