@@ -4,7 +4,7 @@
 > Claude at a glance, switch between them in one keystroke, and never lose track
 > of which project is waiting on you.
 
-![claudemux board](docs/board.svg)
+![claudemux board](docs/board.png)
 
 `claudemux` (command: `cw`) gathers every Claude Code session you have running
 into one tmux session and adds a small curses board on top. The board reads

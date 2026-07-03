@@ -281,8 +281,66 @@ def gather_cards():
             "status": st, "alive": st in ("running", "blocked"), "group": group,
             "needs": needs, "managed": False,
             "win": None, "tr": tr, "tokens": j.get("tokens"),
+            "respawn_flags": j.get("respawnFlags") or [],
         })
     return cards
+
+
+# --------------------------------------------------------------------------
+# demo 数据(无需真实会话即可预览,也用于生成截图)
+# --------------------------------------------------------------------------
+
+def _demo_card(kind, sid, cwd, name, title, status, group, needs=None,
+               todos=None, last_prompt=None, last_asst=None, gitBranch=None,
+               managed=False, age_s=0, respawn_flags=None):
+    now = int(time.time() * 1000)
+    ts = now - age_s * 1000
+    tr = {"title": title, "last_prompt": last_prompt, "last_user": last_prompt,
+          "last_asst": last_asst, "todos": todos or [], "gitBranch": gitBranch,
+          "cwd": cwd, "last_ts": ts}
+    return {"kind": kind, "sid": sid, "sid8": sid[:8], "cwd": cwd, "name": name,
+            "title": title, "status": status, "alive": group != "done",
+            "group": group, "startedAt": ts, "updatedAt": ts, "managed": managed,
+            "win": None, "tr": tr, "needs": needs, "respawn_flags": respawn_flags or []}
+
+
+def demo_cards():
+    t = lambda c, s: {"content": c, "status": s}
+    return [
+        _demo_card("interactive", "a1b2c3d4e5f6", "~/projects/web-app", "web-app",
+                   "refactor auth flow", "busy", "running", managed=True, age_s=180,
+                   last_prompt="refactor the auth flow — extract AuthProvider and add tests",
+                   last_asst="I'll start by extracting the AuthProvider component…",
+                   todos=[t("Refactor AuthProvider", "completed"),
+                          t("Add unit tests", "in_progress"),
+                          t("Update docs", "pending")],
+                   gitBranch="feat/auth-refactor"),
+        _demo_card("bg", "e5f6a7b8c9d0", "~/projects/api-server", "deploy to staging",
+                   "deploy to staging", "blocked", "waiting",
+                   needs="confirm rollback before deploy?", age_s=120,
+                   last_prompt="deploy api-server to staging",
+                   respawn_flags=["--agent", "claude", "--permission-mode", "auto", "--model", "opus"]),
+        _demo_card("bg", "c9d0e1f2a3b4", "~/projects/docs-site", "add API reference",
+                   "add API reference", "blocked", "waiting",
+                   needs="which version — v1 or v2?", age_s=300,
+                   last_prompt="add API reference docs",
+                   respawn_flags=["--agent", "claude", "--permission-mode", "auto"]),
+        _demo_card("interactive", "112233445566", "~/projects/mobile-app", "mobile-app",
+                   "fix push notif", "idle", "external", age_s=720,
+                   last_prompt="fix push notifications on iOS"),
+        _demo_card("interactive", "5566778899aa", "~/projects/ml-pipeline", "ml-pipeline",
+                   "retrain model", "idle", "external", age_s=3600,
+                   last_prompt="retrain the ranking model"),
+        _demo_card("interactive", "99aabbccddee", "~/projects/cli-tool", "cli-tool",
+                   "add --verbose", "busy", "external", age_s=30,
+                   last_prompt="add a --verbose flag"),
+        _demo_card("bg", "ddeeff001122", "~/projects/web-app", "write unit tests",
+                   "write unit tests", "completed", "done", age_s=3600,
+                   last_prompt="write unit tests for auth"),
+        _demo_card("bg", "223344556677", "~/projects/scripts", "cleanup backups",
+                   "cleanup backups", "failed", "done", age_s=10800,
+                   last_prompt="cleanup old backups"),
+    ]
 
 
 GROUPS = [
@@ -442,7 +500,7 @@ def _draw(stdscr, state):
         counts[c["group"]] = counts.get(c["group"], 0) + 1
     head = "claude-wekan  │  " + "  ".join("%s:%d" % (g.upper(), counts.get(g, 0))
                                             for g, _, _ in GROUPS)
-    head += "  │  ↑↓move ⏎switch n:new i:import r:refresh q:quit"
+    head += "  │  ↑↓move ⏎switch/reply n:new i:import r:refresh q:quit"
     stdscr.addnstr(0, 0, _truncate(head, w), w, curses.A_BOLD)
     row = 2
     sel = state["flat"][state["sel"]] if state["flat"] else None
@@ -467,7 +525,7 @@ def _draw(stdscr, state):
             td = todo_summary(c.get("tr", {}).get("todos"))
             td = ("☑%s " % td) if td else ""
             ag = age_str(c.get("updatedAt") or c.get("startedAt"))
-            line = "%s %s %s %-26s %s%s%s" % (mark, stat, proj, title, td, _truncate(task, 28), ag)
+            line = "%s %s %s %-26s %s%s %s" % (mark, stat, proj, title, td, _truncate(task, 28), ag)
             attr = curses.color_pair(gcol)
             if c is sel:
                 attr = curses.color_pair(6) | curses.A_BOLD
@@ -535,6 +593,9 @@ def _edit_line(stdscr, y, x, prompt, default, width):
 
 def _activate(state, stdscr):
     """处理选中卡片的动作。返回 True 表示应退出看板(已切窗口)。"""
+    if state.get("demo"):
+        state["msg"] = "demo 模式 —— 跑 `cw up` 进入真实会话"
+        return False
     if not state["flat"]:
         return False
     c = state["flat"][state["sel"]]
@@ -552,11 +613,34 @@ def _activate(state, stdscr):
             return True
         state["msg"] = "导入失败: %s" % err
         return False
-    if c["kind"] == "bg" and c.get("needs"):
-        # 后台 agent 需要输入:MVP 仅提示,不内嵌回复
-        state["msg"] = "该后台 agent 需要输入(回复功能在快进项): %s" % _truncate(c["needs"], 60)
-        return False
+    if c["kind"] == "bg" and c["group"] == "waiting" and c.get("needs"):
+        return _reply(stdscr, state, c)
     return False
+
+
+def _reply(stdscr, state, c):
+    """给被阻塞的后台 agent 发回复:内嵌输入 → claude --resume <sid> <flags> -p <reply>
+    在新 tmux 窗口跑(响应流可见)→ 切过去。返回 True 表示已切窗口、应退出看板。"""
+    h, w = stdscr.getmaxyx()
+    stdscr.erase()
+    stdscr.addnstr(0, 0, "回复后台 agent(Enter 发送 / Esc 取消)", w, curses.A_BOLD)
+    stdscr.addnstr(2, 0, _truncate("Q: %s" % c.get("needs"), w - 2), w, curses.color_pair(3))
+    stdscr.addnstr(3, 0, _truncate("agent: %s" % c.get("name"), w - 2), w, curses.A_DIM)
+    reply = _edit_line(stdscr, h - 2, 0, ">> ", "", w)
+    if not reply:
+        return False
+    sid = c.get("sid")
+    cwd = c.get("cwd") or "."
+    flags = " ".join(shlex.quote(f) for f in (c.get("respawn_flags") or []))
+    # --resume <sid> + 原始 flags + -p <回复>(headless 一次性发送,响应打印到窗口)
+    cmd = "claude --resume %s %s -p %s" % (shlex.quote(sid), flags, shlex.quote(reply))
+    name = "reply-%s" % c.get("sid8")
+    rc, _, err = tmux(["new-window", "-t", SESSION_NAME, "-n", name, "-c", cwd, cmd])
+    if rc != 0:
+        state["msg"] = "回复失败(先 `cw up`?): %s" % err
+        return False
+    tmux(["select-window", "-t", "%s:%s" % (SESSION_NAME, name)])
+    return True
 
 
 def _new_session(stdscr, state):
@@ -604,11 +688,12 @@ def _new_session(stdscr, state):
     state["cards"] = gather_cards()
 
 
-def _board_main(stdscr):
+def _board_main(stdscr, demo=False):
     _init_colors()
     curses.curs_set(0)
     curses.halfdelay(30)  # 3s 超时 -> 自动刷新
-    state = {"cards": gather_cards(), "sel": 0, "flat": [], "msg": ""}
+    state = {"cards": (demo_cards() if demo else gather_cards()),
+             "sel": 0, "flat": [], "msg": "", "demo": demo}
     while True:
         _build_flat(state)
         try:
@@ -620,12 +705,14 @@ def _board_main(stdscr):
             pass  # 窗口过小时忽略绘制错误,不崩溃
         ch = stdscr.getch()
         if ch == -1:
-            state["cards"] = gather_cards()
+            if not demo:
+                state["cards"] = gather_cards()
             continue
         if ch in (ord("q"),):
             break
         elif ch == ord("r"):
-            state["cards"] = gather_cards()
+            if not demo:
+                state["cards"] = gather_cards()
         elif ch in (curses.KEY_DOWN, ord("j")):
             state["sel"] = min(state["sel"] + 1, max(0, len(state["flat"]) - 1))
         elif ch in (curses.KEY_UP, ord("k")):
@@ -634,7 +721,10 @@ def _board_main(stdscr):
             if _activate(state, stdscr):
                 break
         elif ch == ord("n"):
-            _new_session(stdscr, state)
+            if demo:
+                state["msg"] = "demo 模式 —— 跑 `cw up` 进入真实会话"
+            else:
+                _new_session(stdscr, state)
         elif ch == ord("i"):
             if state["flat"] and state["flat"][state["sel"]].get("group") == "external":
                 if _activate(state, stdscr):
@@ -643,9 +733,9 @@ def _board_main(stdscr):
                 state["msg"] = "选中一个 EXTERNAL 卡片再用 i 导入"
 
 
-def cmd_board():
+def cmd_board(demo=False):
     try:
-        curses.wrapper(_board_main)
+        curses.wrapper(lambda stdscr: _board_main(stdscr, demo))
     except curses.error as e:
         print("curses 错误(终端太小?): %s" % e, file=sys.stderr)
         return 1
@@ -661,8 +751,8 @@ def cmd_status():
     return 0
 
 
-def cmd_list():
-    cards = gather_cards()
+def cmd_list(demo=False):
+    cards = demo_cards() if demo else gather_cards()
     if not cards:
         print("(没发现任何 Claude 会话)")
         return 0
@@ -702,9 +792,11 @@ def main():
     ap = argparse.ArgumentParser(prog="cw", description="Claude 多终端调度器")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("up", help="起/连 tmux 会话并绑定看板热键")
-    sub.add_parser("board", help="运行看板 TUI")
+    p_board = sub.add_parser("board", help="运行看板 TUI")
+    p_board.add_argument("--demo", action="store_true", help="用样例数据预览(不连真实会话)")
     sub.add_parser("status", help="打印会话/作业 JSON")
-    sub.add_parser("list", help="打印看板卡片(纯文本)")
+    p_list = sub.add_parser("list", help="打印看板卡片(纯文本)")
+    p_list.add_argument("--demo", action="store_true", help="用样例数据")
     p_launch = sub.add_parser("launch", help="新建 Claude 窗口")
     p_launch.add_argument("cwd")
     p_launch.add_argument("prompt", nargs="?", default=None)
@@ -715,11 +807,11 @@ def main():
     if cmd == "up":
         return cmd_up()
     if cmd == "board":
-        return cmd_board()
+        return cmd_board(args.demo)
     if cmd == "status":
         return cmd_status()
     if cmd == "list":
-        return cmd_list()
+        return cmd_list(args.demo)
     if cmd == "launch":
         return cmd_launch(args.cwd, args.prompt)
     if cmd == "import":
