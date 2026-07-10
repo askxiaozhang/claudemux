@@ -2,18 +2,27 @@
 """cw — Claude 多终端调度器 (claude-wekan).
 
 tmux 当终端复用骨架,curses 看板做调度层。纯 Python 标准库,无 pip/npm。
-每个 Claude 窗口都是 [看板 30% │ 会话 70%]:左侧常驻实时状态,右侧是对话;
-切会话只是切窗口,左边看板始终可见。看板支持鼠标:点选卡片、再点/双击切换、
-滚轮移动(tmux 侧仅对 cw 会话开 mouse)。
+每个 Claude 窗口都是 [看板 30% │ 会话 55% │ 服务 15%]:左侧常驻实时状态,
+中间是对话,右侧显示活跃服务;切会话只是切窗口,左/右始终可见。
+看板支持鼠标:点选卡片、再点/双击切换、滚轮移动(tmux 侧仅对 cw 会话开 mouse)。
 
 用法:
-  cw up              起/连 tmux 会话 cw,切成 [看板│会话] 并绑定热键
+  cw up              起/连 tmux 会话 cw,切成 [看板│会话│服务] 并绑定热键,自动启动悬浮看板
   cw board           运行看板 TUI(窗格内或普通终端里都可)
-  cw launch <cwd>    新建一个 [看板│会话] 窗口跑 claude(可选初始 prompt)
+  cw services        运行服务面板 TUI(右侧窄栏)
+  cw launch <cwd>    新建一个 [看板│会话│服务] 窗口跑 claude(可选初始 prompt)
   cw import <sid>    用 claude --resume <sid> 把现有会话接进 tmux
-  cw pane board|claude  聚焦/召出当前窗口的某个窗格(热键内部用)
+  cw pane board|claude|services  聚焦/召出当前窗口的某个窗格(热键内部用)
+  cw hud             启动 macOS 原生悬浮看板(也可通过 Ctrl-b h 触发)
   cw status          打印发现的会话/作业(JSON,调试用)
   cw list            打印看板卡片(纯文本)
+
+热键:
+  Ctrl-b b    聚焦看板
+  Ctrl-b B    聚焦会话
+  Ctrl-b s    聚焦服务面板
+  Ctrl-b h    启动/聚焦悬浮看板(HUD)
+  Ctrl-b N    新建 Claude 会话
 """
 import os, sys, json, glob, subprocess, time, re, shlex, curses, argparse
 
@@ -21,10 +30,12 @@ SESSION_NAME = "cw"
 SID8_RE = re.compile(r"-(?P<sid>[0-9a-f]{8})$")
 SCRIPT = os.path.realpath(__file__)
 
-# 左右分栏:左看板(30%) / 右会话(70%)。窗格标题用于在窗口里定位。
+# 左中右分栏:左看板(30%) / 中会话(55%) / 右服务(15%)。窗格标题用于在窗口里定位。
 BOARD_PANE_TITLE = "cw·board"
 CLAUDE_PANE_TITLE = "cw·claude"
+SERVICES_PANE_TITLE = "cw·services"
 BOARD_WIDTH_PCT = "30"
+SERVICES_WIDTH_PCT = "22"  # 占剩余70%的22% ≈ 总宽15%
 
 
 # --------------------------------------------------------------------------
@@ -285,6 +296,10 @@ def _board_cmd():
     return "python3 %s board" % shlex.quote(SCRIPT)
 
 
+def _services_cmd():
+    return "python3 %s services" % shlex.quote(SCRIPT)
+
+
 def current_window():
     """当前活动窗格所在的 window id(如 @3);不在 tmux 里返回 None。"""
     rc, out, _ = tmux(["display-message", "-p", "#{window_id}"])
@@ -331,19 +346,37 @@ def create_board_pane(win):
     return bp
 
 
+def create_services_pane(win):
+    """在 win 右侧切出一个 ~15% 宽的服务面板窗格(不抢焦点),返回 pane_id。"""
+    target = find_pane(win, CLAUDE_PANE_TITLE)
+    if not target:
+        return None
+    rc, out, _ = tmux(["split-window", "-h", "-p", SERVICES_WIDTH_PCT, "-d",
+                       "-t", target, "-P", "-F", "#{pane_id}", _services_cmd()])
+    if rc != 0:
+        return None
+    sp = out.strip()
+    if sp:
+        tmux(["select-pane", "-t", sp, "-T", SERVICES_PANE_TITLE])
+    return sp
+
+
 def make_claude_window(cwd, shell_cmd, name, resolve_sid=True):
-    """新建一个 [看板 30% │ 会话 70%] 窗口并聚焦会话侧。返回 (窗口名, err)。"""
+    """新建一个 [看板 30% │ 会话 55% │ 服务 15%] 窗口并聚焦会话侧。返回 (窗口名, err)。"""
     rc, out, err = tmux(["new-window", "-P", "-F", "#{pane_id}", "-t", SESSION_NAME,
                          "-n", name, "-c", cwd, shell_cmd])
     if rc != 0:
         return None, err
     claude_pane = out.strip()
+    # 左侧看板
     rc2, out2, _ = tmux(["split-window", "-h", "-b", "-p", BOARD_WIDTH_PCT, "-d",
                          "-t", claude_pane, "-P", "-F", "#{pane_id}", _board_cmd()])
     bp = out2.strip() if rc2 == 0 else None
     if bp:
         tmux(["select-pane", "-t", bp, "-T", BOARD_PANE_TITLE])
     tmux(["select-pane", "-t", claude_pane, "-T", CLAUDE_PANE_TITLE])
+    # 右侧服务面板
+    sp = create_services_pane("%s:%s" % (SESSION_NAME, name))
     final = name
     if resolve_sid:
         sid = resolve_new_sid(cwd, timeout=12)
@@ -594,7 +627,7 @@ def cmd_up():
     if new_session:
         tmux(["new-session", "-d", "-s", SESSION_NAME, "-n", "main"])
         print("已创建 tmux 会话 %s" % SESSION_NAME)
-        # 初始窗口切成 [看板 30% │ shell 70%];右侧先占位,看板里按 n 新建首个 Claude
+        # 初始窗口切成 [看板 30% │ shell 55% │ 服务 15%];右侧先占位
         rc, out, _ = tmux(["list-panes", "-t", "%s:main" % SESSION_NAME,
                            "-F", "#{pane_id}"])
         init = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else None
@@ -603,16 +636,32 @@ def cmd_up():
             bp = create_board_pane("%s:main" % SESSION_NAME)
             if bp:
                 tmux(["select-pane", "-t", bp])  # 首次落地看板
+            # 右侧服务面板
+            create_services_pane("%s:main" % SESSION_NAME)
     # Ctrl-b b 聚焦/召出看板(当前窗口没有就切一个);Ctrl-b B 聚焦会话
     tmux(["bind-key", "b", "run-shell", "python3 %s pane board" % SCRIPT])
     tmux(["bind-key", "B", "run-shell", "python3 %s pane claude" % SCRIPT])
+    # Ctrl-b s 聚焦/召出服务面板
+    tmux(["bind-key", "s", "run-shell", "python3 %s pane services" % SCRIPT])
+    # Ctrl-b h 启动/聚焦悬浮看板(HUD)
+    tmux(["bind-key", "h", "run-shell", "python3 %s hud" % SCRIPT])
     # 鼠标:仅对 cw 会话开启(点击看板卡片切换、滚轮移动;不影响你别的 tmux 会话)
     tmux(["set-option", "-t", SESSION_NAME, "mouse", "on"])
     rc, _, err = tmux(["bind-key", "N", "command-prompt",
                        "-p", "cwd:", "run-shell 'python3 %s launch \"%%1\"'" % SCRIPT])
     if rc != 0:
         print("绑定 Ctrl-b N 失败: %s" % err, file=sys.stderr)
-    print("Ctrl-b b = 看板   Ctrl-b B = 会话   Ctrl-b N = 新建   (会话: %s,鼠标已开)" % SESSION_NAME)
+    print("Ctrl-b b = 看板   Ctrl-b B = 会话   Ctrl-b s = 服务   Ctrl-b h = 悬浮   Ctrl-b N = 新建   (会话: %s,鼠标已开)" % SESSION_NAME)
+    # 后台启动 HUD 悬浮窗
+    try:
+        subprocess.Popen(
+            [sys.executable, SCRIPT, "hud"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass  # HUD 启动失败不影响主流程
     if os.environ.get("TMUX"):
         tmux(["switch-client", "-t", SESSION_NAME])
     else:
@@ -621,7 +670,7 @@ def cmd_up():
 
 
 def cmd_pane(which):
-    """聚焦/召出当前窗口的某个窗格(供 Ctrl-b b/B 调用)。"""
+    """聚焦/召出当前窗口的某个窗格(供 Ctrl-b b/B/s 调用)。"""
     win = current_window()
     if not win:
         print("不在 tmux 里,无法定位窗格", file=sys.stderr)
@@ -634,8 +683,12 @@ def cmd_pane(which):
         cp = find_pane(win, CLAUDE_PANE_TITLE)
         if cp:
             tmux(["select-pane", "-t", cp])
+    elif which == "services":
+        sp = find_pane(win, SERVICES_PANE_TITLE) or create_services_pane(win)
+        if sp:
+            tmux(["select-pane", "-t", sp])
     else:
-        print("用法: cw pane board|claude", file=sys.stderr)
+        print("用法: cw pane board|claude|services", file=sys.stderr)
         return 1
     return 0
 
@@ -1267,6 +1320,61 @@ def cmd_board(demo=False):
 
 
 # --------------------------------------------------------------------------
+# 服务面板 TUI(右侧窄栏,显示运行中的会话/任务)
+# --------------------------------------------------------------------------
+
+def _services_main(stdscr):
+    """服务面板:显示所有活跃的会话和后台任务,紧凑列表。"""
+    _init_colors()
+    curses.curs_set(0)
+    curses.halfdelay(30)  # 3s 超时 -> 自动刷新
+    while True:
+        cards = gather_cards()
+        # 只保留活跃的(非 done)
+        active = [c for c in cards if c["group"] != "done"]
+        h, w = stdscr.getmaxyx()
+        stdscr.erase()
+        # 标题
+        _put(stdscr, 0, 0, "服务", w, curses.color_pair(8) | curses.A_BOLD)
+        count_text = "%d 活跃" % len(active)
+        _put(stdscr, 0, 6, count_text, w, curses.A_DIM)
+        # 分隔线
+        _put(stdscr, 1, 0, "─" * w, w, curses.A_DIM)
+        # 列表
+        row = 2
+        for c in active[:h - 4]:  # 留几行底部空间
+            glyph, gc = _status_glyph(c)
+            proj = _truncate(projshort(c.get("cwd")), 10)
+            title = _truncate(c.get("title") or c.get("name"), w - 14)
+            cfg = c.get("config")
+            cfg_tag = "[%s] " % cfg if cfg and cfg != "default" else ""
+            line = "%s%s %s" % (cfg_tag, proj, title)
+            _put(stdscr, row, 0, glyph, w, curses.color_pair(gc) | curses.A_BOLD)
+            _put(stdscr, row, 2, _truncate(line, w - 2), w, curses.A_DIM)
+            row += 1
+        if not active:
+            _put(stdscr, 3, 0, "(无活跃服务)", w, curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord("q"),):
+            # q: 聚焦回会话窗格
+            cp = find_pane(current_window(), CLAUDE_PANE_TITLE)
+            if cp:
+                tmux(["select-pane", "-t", cp])
+            else:
+                break
+
+
+def cmd_services():
+    try:
+        curses.wrapper(_services_main)
+    except curses.error as e:
+        print("curses 错误(终端太小?): %s" % e, file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
 # 文本输出:status / list
 # --------------------------------------------------------------------------
 
@@ -1832,9 +1940,10 @@ def main():
                           help="配置标签 default/doubao/official(默认 default)")
     p_imp = sub.add_parser("import", help="用 --resume 导入现有会话")
     p_imp.add_argument("sid")
-    p_pane = sub.add_parser("pane", help="聚焦/召出当前窗口的窗格(board|claude)")
-    p_pane.add_argument("which", choices=["board", "claude"])
+    p_pane = sub.add_parser("pane", help="聚焦/召出当前窗口的窗格(board|claude|services)")
+    p_pane.add_argument("which", choices=["board", "claude", "services"])
     sub.add_parser("hud", help="macOS 原生悬浮看板(置顶浮窗,需 PyObjC)")
+    sub.add_parser("services", help="运行服务面板 TUI(右侧窄栏)")
     args = ap.parse_args()
     cmd = args.cmd or "up"
     if cmd == "up":
@@ -1853,6 +1962,8 @@ def main():
         return cmd_pane(args.which)
     if cmd == "hud":
         return cmd_hud()
+    if cmd == "services":
+        return cmd_services()
     ap.print_help()
     return 1
 
