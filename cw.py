@@ -3,28 +3,46 @@
 
 tmux 当终端复用骨架,curses 看板做调度层。纯 Python 标准库,无 pip/npm。
 每个 Claude 窗口都是 [看板 30% │ 会话 55% │ 服务 15%]:左侧常驻实时状态,
-中间是对话,右侧显示活跃服务;切会话只是切窗口,左/右始终可见。
+中间是对话,右侧显示本机/项目监听端口(backend);切会话只是切窗口,左/右始终可见。
 看板支持鼠标:点选卡片、再点/双击切换、滚轮移动(tmux 侧仅对 cw 会话开 mouse)。
 
 用法:
   cw up              起/连 tmux 会话 cw,切成 [看板│会话│服务] 并绑定热键,自动启动悬浮看板
   cw board           运行看板 TUI(窗格内或普通终端里都可)
-  cw services        运行服务面板 TUI(右侧窄栏)
+  cw services        运行服务面板 TUI(右侧窄栏:port-project 列表)
   cw launch <cwd>    新建一个 [看板│会话│服务] 窗口跑 claude(可选初始 prompt)
   cw import <sid>    用 claude --resume <sid> 把现有会话接进 tmux
   cw pane board|claude|services  聚焦/召出当前窗口的某个窗格(热键内部用)
-  cw hud             启动 macOS 原生悬浮看板(也可通过 Ctrl-b h 触发)
+  cw pin <sid>       把 session 钉到当前窗口会话区并排(切分/resume/并入)
+  cw unpin <sid8|current>  取消钉选(杀该 pane,session 留盘)
+  cw hud             启动/聚焦 macOS 原生悬浮看板(也可通过 Ctrl-b h 触发)
   cw status          打印发现的会话/作业(JSON,调试用)
   cw list            打印看板卡片(纯文本)
 
 热键:
   Ctrl-b b    聚焦看板
-  Ctrl-b B    聚焦会话
+  Ctrl-b B    聚焦会话(多切分时循环到下一个)
   Ctrl-b s    聚焦服务面板
-  Ctrl-b h    启动/聚焦悬浮看板(HUD)
+  Ctrl-b g    服务面板切换 项目端口 ↔ 全机端口
+  Ctrl-b h    启动/聚焦悬浮看板(钉看板 HUD)
   Ctrl-b N    新建 Claude 会话
+  Ctrl-b V    取消当前聚焦的会话窗格(杀掉,session 留盘)
+
+看板内:
+  点 ●/○     钉选中会话到当前窗口中间并排 / 再点取消(鼠标主操作,各 pane 不同色)
+  ↑↓ / j k    移动
+  Enter/Space 切到选中会话 / 折叠项目
+  i           导入选中的 EXTERNAL 会话
+  n           新建会话
+  v / V       钉选 / 取消(键盘别名,等同点圆点)
+
+服务面板内:
+  g / Tab     项目端口 ↔ 全机端口
+  ↑↓ / j k    滚动
+  r           刷新
+  q           回会话窗格
 """
-import os, sys, json, glob, subprocess, time, re, shlex, curses, argparse
+import os, sys, json, glob, subprocess, time, re, shlex, curses, argparse, shutil
 
 SESSION_NAME = "cw"
 SID8_RE = re.compile(r"-(?P<sid>[0-9a-f]{8})$")
@@ -36,6 +54,26 @@ CLAUDE_PANE_TITLE = "cw·claude"
 SERVICES_PANE_TITLE = "cw·services"
 BOARD_WIDTH_PCT = "30"
 SERVICES_WIDTH_PCT = "22"  # 占剩余70%的22% ≈ 总宽15%
+
+# 会话 pane 的 sid8 存在 pane 用户选项 @cwsid 里(claude 会改 pane 标题成 ✳<任务>,
+# 但改不了用户选项),@cwtint 存稳定配色。两者都 pane-local、不被应用覆盖。
+CLAUDE_PANE_PREFIX = "cw·claude·"  # best-effort 标题(claude 启动后会被改写)
+CLAUDE_PANE_RE = re.compile(r"[0-9a-f]{8}")
+# pane 顶部色条格式:@cwtint 已设 -> 上色块 + 白字;标题用 @cwsid(claude pane)或 pane_title(其余)。
+PANE_BORDER_FORMAT = "#{?@cwtint,#[bg=#{@cwtint}]#[fg=white] ,}#{?@cwsid,cw·#{@cwsid},#{pane_title}}#[default]"
+# 每个 session 的稳定配色:sid8 哈希到 8 色调色板(tmux 256 色,深色终端可区分)。
+PANE_TINTS = ["colour18", "colour22", "colour30", "colour58",
+              "colour94", "colour52", "colour53", "colour55"]
+# 对应的 curses 256 色 ID(给看板圆点用,与 pane 边框 @cwtint 同色)。
+_TINT_COLOR_IDS = [18, 22, 30, 58, 94, 52, 53, 55]
+
+
+def color_for_sid8(sid8):
+    """sid8 -> 稳定的 tmux 颜色名(用于 pane 边框色条)。"""
+    try:
+        return PANE_TINTS[int(sid8, 16) % len(PANE_TINTS)]
+    except (ValueError, TypeError):
+        return PANE_TINTS[0]
 
 
 # --------------------------------------------------------------------------
@@ -119,16 +157,51 @@ def toggle_archived(sid):
 
 
 
+_CLAUDE_BIN = None
+
+
+def _claude_bin():
+    """解析 claude 可执行路径。优先 PATH 上的 claude;否则找 npm 全局装的 claude.exe
+    或 ~/.claude/local/claude。近期 claude 重装可能只留 claude.exe、没建 claude 软链,
+    导致 tmux 非交互 shell(split-window/new-window)里 'claude' 找不到 -> pane 秒退。
+    结果缓存。"""
+    global _CLAUDE_BIN
+    if _CLAUDE_BIN is not None:
+        return _CLAUDE_BIN
+    p = shutil.which("claude")
+    if p:
+        _CLAUDE_BIN = p
+        return p
+    cands = [
+        "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+        os.path.expanduser("~/.claude/local/claude"),
+        os.path.expanduser("~/.claude/local/claude.exe"),
+    ]
+    try:
+        r = subprocess.run(["npm", "root", "-g"], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            cands.append(r.stdout.strip() + "/@anthropic-ai/claude-code/bin/claude.exe")
+    except Exception:
+        pass
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            _CLAUDE_BIN = c
+            return c
+    _CLAUDE_BIN = "claude"  # 回退:让 shell 自己解析
+    return _CLAUDE_BIN
+
+
 def claude_cmd(base, rest=""):
     """构造带 CLAUDE_CONFIG_DIR 的 claude 命令,确保接到正确的配置/模型。
-    base 为 None 或默认 ~/.claude 时不加前缀(等价于裸 claude)。"""
+    base 为 None 或默认 ~/.claude 时不加前缀(等价于裸 claude)。
+    claude 用绝对路径(_claude_bin),避免 tmux 非交互 shell 里 'claude' 不在 PATH。"""
     prefix = ""
     if base:
         ab = os.path.abspath(expand(base))
         if ab != os.path.abspath(expand("~/.claude")):
             prefix = "CLAUDE_CONFIG_DIR=%s " % shlex.quote(ab)
     rest = (" " + rest) if rest else ""
-    return "%sclaude%s" % (prefix, rest)
+    return "%s%s%s" % (prefix, shlex.quote(_claude_bin()), rest)
 
 
 def list_sessions(base):
@@ -282,10 +355,309 @@ def managed_sids(session=SESSION_NAME):
     return m
 
 
+def managed_panes(session=SESSION_NAME):
+    """sid8 -> {wid, name, pane}:扫所有窗口 pane 的 @cwsid(pane 用户选项,claude 改不掉)。
+    权威的「live session -> pane」映射(一个窗口可并排多个切分 pane)。
+    一个 sid 全局只应出现一次;异常多次时后扫的覆盖。"""
+    m = {}
+    for w in tmux_windows(session):
+        win = "%s:%s" % (session, w["index"])
+        rc, out, _ = tmux(["list-panes", "-t", win, "-F",
+                           "#{window_id}\t#{window_name}\t#{pane_id}\t#{@cwsid}"])
+        if rc != 0:
+            continue
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            wid, wname, pane, sid8 = parts[0], parts[1], parts[2], parts[3]
+            if sid8 and CLAUDE_PANE_RE.fullmatch(sid8):
+                m[sid8] = {"wid": wid, "name": wname, "pane": pane}
+    return m
+
+
+def _claude_panes_in_win(win):
+    """窗口 win 里所有 claude pane(@cwsid 已设)的 pane_id,按出现顺序。"""
+    if not win:
+        return []
+    rc, out, _ = tmux(["list-panes", "-t", win, "-F", "#{@cwsid}\t#{pane_id}"])
+    if rc != 0:
+        return []
+    panes = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] and CLAUDE_PANE_RE.fullmatch(parts[0]):
+            panes.append(parts[1])
+    return panes
+
+
+def find_claude_pane_by_sid(win, sid8):
+    """窗口 win 里 @cwsid == sid8 的 pane;返回 pane_id 或 None。"""
+    if not win or not sid8:
+        return None
+    rc, out, _ = tmux(["list-panes", "-t", win, "-F", "#{@cwsid}\t#{pane_id}"])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == sid8:
+            return parts[1]
+    return None
+
+
+def pinned_sid8s(win):
+    """win 里各 claude pane 的 sid8 集合(即钉在中间并排的会话)。"""
+    if not win:
+        return set()
+    rc, out, _ = tmux(["list-panes", "-t", win, "-F", "#{@cwsid}"])
+    if rc != 0:
+        return set()
+    s = set()
+    for ln in out.splitlines():
+        v = ln.strip()
+        if v and CLAUDE_PANE_RE.fullmatch(v):
+            s.add(v)
+    return s
+
+
+def _tag_claude_pane(pane, sid):
+    """给 claude pane 打 @cwsid=<sid8> + @cwtint=稳定配色(pane 用户选项,claude 改不掉)。
+    另设标题 cw·claude·<sid8> 作 best-effort(claude 启动后会被改成 ✳<任务>,但不影响追踪)。
+    sid 为 None/空时退回无 sid 标题 cw·claude(保底)。"""
+    if not pane:
+        return
+    sid8 = (sid or "")[:8]
+    if sid8 and CLAUDE_PANE_RE.fullmatch(sid8):
+        tmux(["select-pane", "-t", pane, "-T", "%s%s" % (CLAUDE_PANE_PREFIX, sid8)])
+        tmux(["set-option", "-p", "-t", pane, "@cwsid", sid8])
+        tmux(["set-option", "-p", "-t", pane, "@cwtint", color_for_sid8(sid8)])
+    else:
+        tmux(["select-pane", "-t", pane, "-T", CLAUDE_PANE_TITLE])
+
+
+def _enable_border_bars(win):
+    """在 win 上开 pane 顶部色条(显示 @cwsid 或 pane 标题,会话 pane 按 @cwtint 上色)。仅 cw 会话用。"""
+    if not win:
+        return
+    tmux(["set-option", "-t", win, "pane-border-status", "top"])
+    tmux(["set-option", "-t", win, "pane-border-format", PANE_BORDER_FORMAT])
+
+
+def _migrate_claude_panes(session=SESSION_NAME):
+    """老窗口的 claude pane 没有 @cwsid(标题早被 claude 改成 ✳<任务>)-> 按 window 名里的
+    sid8 给它补 @cwsid + @cwtint,使 managed_panes 能认出。仅 cw up 时跑一次。
+    每个老窗口里「非 board/非 services」的那个 pane 即 claude pane。"""
+    for sid8, wname in managed_sids(session).items():
+        win = "%s:%s" % (session, wname)
+        rc, out, _ = tmux(["list-panes", "-t", win, "-F",
+                           "#{pane_title}\t#{pane_id}\t#{@cwsid}"])
+        if rc != 0:
+            continue
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            title, pane, have = parts[0], parts[1], parts[2]
+            if title == BOARD_PANE_TITLE or title == SERVICES_PANE_TITLE:
+                continue  # board/services 不动
+            if have:  # 已有 @cwsid,只补色
+                tmux(["set-option", "-p", "-t", pane, "@cwtint", color_for_sid8(sid8)])
+                continue
+            # 无 @cwsid 的非 board/services pane = 老 claude pane
+            tmux(["set-option", "-p", "-t", pane, "@cwsid", sid8])
+            tmux(["set-option", "-p", "-t", pane, "@cwtint", color_for_sid8(sid8)])
+            tmux(["select-pane", "-t", pane, "-T", "%s%s" % (CLAUDE_PANE_PREFIX, sid8)])
+
+
 def projshort(cwd):
     if not cwd:
         return "?"
     return os.path.basename(cwd.rstrip("/")) or cwd
+
+
+# --------------------------------------------------------------------------
+# 监听端口发现(右侧服务面板用)
+# --------------------------------------------------------------------------
+
+# 纯系统噪音:全机模式下也默认折叠,可按需再看(避免 ControlCenter/rapportd 刷屏)
+_SYSTEM_LISTEN_CMDS = frozenset({
+    "ControlCenter", "ControlCe", "rapportd", "launchd", "SystemUIServer",
+    "sharingd", "identityservicesd", "mDNSResponder", "netbiosd",
+    "bluetoothd", "coreaudiod", "WindowServer", "loginwindow",
+    "UserEventAgent", "distnoted", "cfprefsd", "notifyd",
+})
+
+# 解析 lsof -iTCP -sTCP:LISTEN 的 NAME 列: 127.0.0.1:8000 / *:7077 / [::1]:55585
+_LISTEN_ADDR_RE = re.compile(
+    r"(?:\[(?P<v6>[^\]]+)\]|(?P<v4>[^:]+)):(?P<port>\d+)$"
+)
+
+
+def _pids_cwd(pids):
+    """批量读进程 cwd,{pid: cwd}。"""
+    out = {}
+    if not pids:
+        return out
+    # lsof -p 支持逗号分隔;分批避免命令行过长
+    plist = sorted(set(int(p) for p in pids))
+    for i in range(0, len(plist), 40):
+        batch = plist[i:i + 40]
+        try:
+            r = subprocess.run(
+                ["lsof", "-a", "-d", "cwd", "-Fn",
+                 "-p", ",".join(str(p) for p in batch)],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+        cur_pid = None
+        for line in r.stdout.splitlines():
+            if not line:
+                continue
+            if line[0] == "p":
+                try:
+                    cur_pid = int(line[1:])
+                except ValueError:
+                    cur_pid = None
+            elif line[0] == "n" and cur_pid is not None:
+                out[cur_pid] = line[1:] or None
+    return out
+
+
+def _claude_project_roots():
+    """Claude 会话/作业的项目根路径集合(绝对路径)。"""
+    roots = set()
+    for base in default_sources():
+        for s in list_sessions(base):
+            if not s.get("alive"):
+                continue
+            cwd = s.get("cwd")
+            if cwd:
+                roots.add(os.path.abspath(expand(cwd)))
+        for j in list_jobs(base):
+            cwd = j.get("cwd") or (j.get("detail") or {}).get("cwd")
+            if cwd:
+                roots.add(os.path.abspath(expand(cwd)))
+    return roots
+
+
+def _match_project_root(cwd, roots):
+    """cwd 落在的最长 Claude 项目根;不匹配返回 None。"""
+    if not cwd or not roots:
+        return None
+    try:
+        ac = os.path.abspath(cwd)
+    except Exception:
+        return None
+    best = None
+    for r in roots:
+        if ac == r or ac.startswith(r + os.sep):
+            if best is None or len(r) > len(best):
+                best = r
+    return best
+
+
+# 无意义的 cwd 末级名(App 沙盒 Data 等)→ 展示时回退到进程名
+_GENERIC_CWD_NAMES = frozenset({
+    "Data", "MacOS", "Contents", "Home", "tmp", "temp", "var", "private",
+    "Application Support", "Caches", "Resources", "/", "bin", "sbin",
+})
+
+
+def _display_project(cwd, cmd, roots):
+    """解析展示用项目名:优先 Claude 根,其次有意义的 cwd 名,否则 cmd。"""
+    root = _match_project_root(cwd, roots)
+    if root:
+        return projshort(root), True
+    if cwd:
+        base = projshort(cwd)
+        if base and base not in _GENERIC_CWD_NAMES and not base.startswith("."):
+            return base, False
+    return (cmd or "?"), False
+
+
+def list_listening_ports(mode="project"):
+    """扫描本机 TCP LISTEN,返回按 port 排序的条目列表。
+
+    每项: {port, pid, cmd, cwd, project, label, system, in_claude}
+    mode:
+      - "project": 只保留 cwd 落在 Claude 会话项目下的端口(backend 视角)
+      - "all": 本机用户相关监听(默认隐藏纯系统 daemon)
+    展示名 label = "port-project"(无项目时用 cmd 名)。
+    """
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
+            capture_output=True, text=True, timeout=4,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return []
+
+    # -F pcn: p=PID, c=COMMAND, n=NAME(可能多行)
+    entries = []
+    cur = None
+    for line in r.stdout.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            if cur and cur.get("ports"):
+                entries.append(cur)
+            try:
+                pid = int(val)
+            except ValueError:
+                cur = None
+                continue
+            cur = {"pid": pid, "cmd": "?", "ports": []}
+        elif tag == "c" and cur is not None:
+            cur["cmd"] = val
+        elif tag == "n" and cur is not None:
+            m = _LISTEN_ADDR_RE.search(val)
+            if m:
+                try:
+                    cur["ports"].append(int(m.group("port")))
+                except ValueError:
+                    pass
+    if cur and cur.get("ports"):
+        entries.append(cur)
+
+    # 全机模式先滤系统 daemon,再批量取 cwd
+    filtered = []
+    for e in entries:
+        cmd = e["cmd"]
+        is_sys = cmd in _SYSTEM_LISTEN_CMDS or cmd.startswith("com.apple.")
+        e["system"] = is_sys
+        if mode == "all" and is_sys:
+            continue
+        filtered.append(e)
+
+    cwd_map = _pids_cwd([e["pid"] for e in filtered])
+    roots = _claude_project_roots()  # 两种模式都用于命名;project 模式再过滤
+    out = []
+    seen = set()  # (port, pid) 去重(IPv4/IPv6 双栈)
+    for e in filtered:
+        pid = e["pid"]
+        cwd = cwd_map.get(pid)
+        project, in_claude = _display_project(cwd, e["cmd"], roots)
+        if mode == "project" and not in_claude:
+            continue
+        for port in sorted(set(e["ports"])):
+            key = (port, pid)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "port": port,
+                "pid": pid,
+                "cmd": e["cmd"],
+                "cwd": cwd,
+                "project": project,
+                "system": e["system"],
+                "in_claude": in_claude,
+                "label": "%d-%s" % (port, project),
+            })
+    out.sort(key=lambda x: (x["port"], x["project"] or x["cmd"], x["pid"]))
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -378,11 +750,19 @@ def make_claude_window(cwd, shell_cmd, name, resolve_sid=True):
     # 右侧服务面板
     sp = create_services_pane("%s:%s" % (SESSION_NAME, name))
     final = name
+    out_sid = None
     if resolve_sid:
-        sid = resolve_new_sid(cwd, timeout=12)
-        if sid:
-            final = "%s-%s" % (name, sid[:8])
+        out_sid = resolve_new_sid(cwd, timeout=12)
+        if out_sid:
+            final = "%s-%s" % (name, out_sid[:8])
             tmux(["rename-window", "-t", "%s:%s" % (SESSION_NAME, name), final])
+    else:
+        # 导入/回复:窗口名里已带 sid8,取出来给 pane 打标
+        mt = SID8_RE.search(name)
+        if mt:
+            out_sid = mt.group("sid")
+    _tag_claude_pane(claude_pane, out_sid)
+    _enable_border_bars("%s:%s" % (SESSION_NAME, final))
     tmux(["select-window", "-t", "%s:%s" % (SESSION_NAME, final)])
     tmux(["select-pane", "-t", claude_pane])
     return final, None
@@ -433,7 +813,7 @@ def gather_cards():
     # .claude 与 .claude-doubao 会互相镜像,按 sessionId 去重(保留 doubao 在前)
     sessions = _dedup_by_sid(sessions)
     jobs = _dedup_by_sid(jobs)
-    managed = managed_sids()
+    managed = managed_panes()
 
     cards = []
     for s in sessions:
@@ -456,7 +836,8 @@ def gather_cards():
             "title": tr["title"], "status": status, "alive": s.get("alive"),
             "group": group, "startedAt": s.get("startedAt"),
             "updatedAt": s.get("updatedAt"), "managed": is_managed,
-            "win": managed.get(sid8), "tr": tr, "needs": None,
+            "win": managed[sid8]["name"] if is_managed else None,
+            "tr": tr, "needs": None,
             "source": base, "config": config_label(base),
         })
     for j in jobs:
@@ -621,6 +1002,186 @@ def cmd_import(sid):
     return 0
 
 
+# --------------------------------------------------------------------------
+# 会话区 y 轴切分:把多个 session 钉到当前窗口中间并排(路线1 live 可交互)
+# --------------------------------------------------------------------------
+
+def _balance_claude_panes(win):
+    """等宽重排 win 里的 claude pane(不动 board/services)。列太窄时返回提示串。"""
+    panes = _claude_panes_in_win(win)
+    n = len(panes)
+    if n <= 1:
+        return None
+    rc, out, _ = tmux(["display-message", "-p", "-t", win, "#{window_width}"])
+    if rc != 0:
+        return None
+    try:
+        total = int(out.strip())
+    except ValueError:
+        return None
+    # 中间区 = 总宽 - board(30%) - services(22% of 剩余70%)
+    claude_total = total * 0.70 * (1 - 0.22)
+    each = max(8, int(claude_total) // n)
+    for p in panes:
+        tmux(["resize-pane", "-t", p, "-x", str(each)])
+    if each < 24:
+        return "列太窄(%d 列),建议减少绑定" % each
+    return None
+
+
+def _sid_pid(sid):
+    """sid(8 位或完整)对应的 live claude 进程 pid;无则 None。"""
+    if not sid:
+        return None
+    for b in default_sources():
+        for s in list_sessions(b):
+            ssid = s.get("sessionId", "")
+            if ssid and (ssid == sid or ssid.startswith(sid)) and s.get("alive"):
+                return s.get("pid")
+    return None
+
+
+def _kill_claude_pane(pane, sid):
+    """杀掉 claude pane 并确保进程死:kill-pane + 对 sid 的 pid SIGKILL(防孤儿,
+    claude 可能不响应 tmux 的 SIGHUP)。"""
+    if pane:
+        tmux(["kill-pane", "-t", pane])
+    pid = _sid_pid(sid)
+    if pid:
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
+
+
+def _resume_into_split(win, sid, sid8, cwd, base):
+    """在 win 会话区开 claude --resume <sid>:若有个空 shell pane(标题恰为 cw·claude,
+    没跑 claude)直接复用它;否则切分一列。打标+等宽+聚焦。返回 (ok, msg)。"""
+    anchor = _claude_panes_in_win(win)
+    anchor_pane = anchor[0] if anchor else find_pane(win, CLAUDE_PANE_TITLE)
+    # 锚点是空 shell(标题恰为 cw·claude,claude 没跑)-> 复用它跑 resume,不切分出死 shell
+    if anchor_pane and not anchor:
+        rc, out, _ = tmux(["display-message", "-p", "-t", anchor_pane, "#{pane_title}"])
+        title = out.strip() if rc == 0 else ""
+        if title == CLAUDE_PANE_TITLE:
+            rc, _, err = tmux(["respawn-pane", "-k", "-t", anchor_pane, "-c", cwd,
+                               claude_cmd(base, "--resume " + shlex.quote(sid))])
+            if rc == 0:
+                _tag_claude_pane(anchor_pane, sid)
+                _balance_claude_panes(win)
+                tmux(["select-pane", "-t", anchor_pane])
+                return True, "已钉 %s" % sid8
+            return False, "启动失败: %s" % err
+    split_target = anchor_pane or find_pane(win, BOARD_PANE_TITLE) or win
+    rc, out, _ = tmux(["split-window", "-h", "-p", "50", "-d", "-t", split_target,
+                       "-P", "-F", "#{pane_id}", "-c", cwd,
+                       claude_cmd(base, "--resume " + shlex.quote(sid))])
+    new = out.strip() if rc == 0 else None
+    if not new:
+        return False, "切分失败(先 cw up?)"
+    _tag_claude_pane(new, sid)
+    hint = _balance_claude_panes(win)
+    tmux(["select-pane", "-t", new])
+    return True, hint or ("已钉 %s" % sid8)
+
+
+def _sid_in_cw_tmux(sid):
+    """sid 的 live 进程是否跑在 cw 会话的某个 tmux pane 里(含无 @cwsid 的未追踪 pane,
+    如 main 窗里裸跑的 claude)。用 pid 的 tty 对比 cw 各 pane 的 tty。
+    裸终端里跑的 ext session 不算(其 tty 不在 cw pane 里)。"""
+    pid = None
+    for b in default_sources():
+        for s in list_sessions(b):
+            if s.get("sessionId") == sid and s.get("alive"):
+                pid = s.get("pid")
+                break
+        if pid:
+            break
+    if not pid:
+        return False
+    try:
+        r = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
+                           capture_output=True, text=True, timeout=2)
+    except Exception:
+        return False
+    tty = r.stdout.strip()
+    if not tty or tty == "?":
+        return False
+    tty_path = tty if tty.startswith("/") else "/dev/%s" % tty
+    rc, out, _ = tmux(["list-panes", "-t", SESSION_NAME, "-a", "-F", "#{pane_tty}"])
+    if rc != 0:
+        return False
+    return tty_path in [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+
+def pin_session(sid, cwd=None, base=None):
+    """把 session 钉到当前窗口会话区并排:没开过 -> 切分+resume;在别窗开过 ->
+    关掉那边(进程一并 SIGKILL)+ 这边重新 resume(不用 move-pane,稳);已在本窗 ->
+    聚焦。一个 sid 全局只一个 live 实例。返回 (ok, msg)。"""
+    if not sid:
+        return False, "没有 sid"
+    win = current_window()
+    if not win:
+        return False, "不在 tmux 里(先 cw up)"
+    sid8 = sid[:8]
+    if not cwd:
+        b2, c2 = find_session(sid)
+        if not c2:
+            return False, "找不到 session %s 的 cwd" % sid8
+        cwd, base = c2, b2
+    if not base:
+        base = config_base(None)
+
+    mp = managed_panes()
+    if sid8 in mp:  # 已 live(受管)
+        loc = mp[sid8]
+        if loc["wid"] == win:
+            # 就是当前窗口自己的会话,没法跟自己切分;留在看板提示,不跳焦点
+            return True, "%s 已在当前窗口;选「另一个」会话再钉才会切分并排" % sid8
+        # 在别的窗口:关掉那边(pane+进程)+ 这边重新 resume。不用 move-pane,不丢窗口不留孤儿。
+        _kill_claude_pane(loc["pane"], sid)
+        if not _claude_panes_in_win(loc["wid"]):
+            tmux(["kill-window", "-t", loc["wid"]])
+
+    # 防未追踪的 cw 内裸跑(main 窗等,窗口名无 sid8 没 @cwsid)被二次 resume。
+    # 裸终端 ext session 的 tty 不在 cw pane 里,放行(等同 import resume)。
+    if _sid_in_cw_tmux(sid):
+        return False, ("%s 已在 cw 的某个窗格里运行但未被追踪(窗口名无 sid8?)；"
+                       "先 cw up 追踪或关掉它再钉" % sid8)
+    return _resume_into_split(win, sid, sid8, cwd, base)
+
+
+def unpin_session(target):
+    """取消钉选:target=sid8 -> 杀当前窗口内该 pane;target='current' -> 杀当前聚焦的
+    claude pane。session 留盘,重绑时 resume 新的。返回 (ok, msg)。"""
+    win = current_window()
+    if not win:
+        return False, "不在 tmux 里"
+    pane = sid8 = None
+    if target == "current":
+        rc, out, _ = tmux(["display-message", "-p", "#{pane_id}\t#{@cwsid}"])
+        if rc == 0:
+            parts = out.strip().split("\t")
+            if len(parts) >= 2:
+                pane = parts[0]
+                sid8 = parts[1] if parts[1] else None
+                if not sid8:
+                    return False, "当前聚焦的不是会话窗格"
+    else:
+        sid8 = target[:8]
+        pane = find_claude_pane_by_sid(win, sid8)
+        if not pane:
+            return False, "%s 不在当前窗口切分里" % sid8
+    if not pane:
+        return False, "找不到要取消的窗格"
+    rest = [p for p in _claude_panes_in_win(win) if p != pane]
+    _kill_claude_pane(pane, sid8)  # kill-pane + SIGKILL claude 进程,防孤儿
+    if rest:
+        tmux(["select-pane", "-t", rest[0]])
+        _balance_claude_panes(win)
+    return True, "已取消 %s" % (sid8 or "窗格")
+
+
 def cmd_up():
     rc, _, _ = tmux(["has-session", "-t", SESSION_NAME])
     new_session = rc != 0
@@ -643,16 +1204,33 @@ def cmd_up():
     tmux(["bind-key", "B", "run-shell", "python3 %s pane claude" % SCRIPT])
     # Ctrl-b s 聚焦/召出服务面板
     tmux(["bind-key", "s", "run-shell", "python3 %s pane services" % SCRIPT])
-    # Ctrl-b h 启动/聚焦悬浮看板(HUD)
+    # Ctrl-b g 服务面板:项目端口 ↔ 全机端口
+    tmux(["bind-key", "g", "run-shell", "python3 %s services-toggle" % SCRIPT])
+    # Ctrl-b h 启动/聚焦悬浮看板(钉看板 HUD)
     tmux(["bind-key", "h", "run-shell", "python3 %s hud" % SCRIPT])
+    # Ctrl-b V 取消当前聚焦的会话窗格(杀掉,session 留盘)
+    tmux(["bind-key", "V", "run-shell", "python3 %s unpin current" % SCRIPT])
     # 鼠标:仅对 cw 会话开启(点击看板卡片切换、滚轮移动;不影响你别的 tmux 会话)
     tmux(["set-option", "-t", SESSION_NAME, "mouse", "on"])
+    # pane 顶部色条(显示标题,会话 pane 按 sid8 上色)+ 迁移老 pane 的 @cwsid
+    for w in tmux_windows(SESSION_NAME):
+        _enable_border_bars("%s:%s" % (SESSION_NAME, w["index"]))
+    _migrate_claude_panes()
     rc, _, err = tmux(["bind-key", "N", "command-prompt",
                        "-p", "cwd:", "run-shell 'python3 %s launch \"%%1\"'" % SCRIPT])
     if rc != 0:
         print("绑定 Ctrl-b N 失败: %s" % err, file=sys.stderr)
-    print("Ctrl-b b = 看板   Ctrl-b B = 会话   Ctrl-b s = 服务   Ctrl-b h = 悬浮   Ctrl-b N = 新建   (会话: %s,鼠标已开)" % SESSION_NAME)
-    # 后台启动 HUD 悬浮窗
+    # 代码更新后刷新已有服务/看板窗格,立刻吃到新逻辑(含 v/V 切分热键)
+    n = respawn_services_panes()
+    if n:
+        print("已重载 %d 个服务面板" % n)
+    nb = respawn_board_panes()
+    if nb:
+        print("已重载 %d 个看板(v=钉 V=取消)" % nb)
+    print("Ctrl-b b=看板  B=会话(循环切分)  s=服务  g=项目/全机端口  h=钉看板  N=新建  V=取消当前会话窗格  (会话:%s,鼠标已开)"
+          % SESSION_NAME)
+    print("看板内: 点圆点●=钉入中间并排/再点取消(鼠标)  v/V=键盘别名  (会话区可 y 轴切分多开,各 pane 不同色)")
+    # 后台启动 HUD 悬浮窗(已在跑则只聚焦,不重复起)
     try:
         subprocess.Popen(
             [sys.executable, SCRIPT, "hud"],
@@ -680,9 +1258,17 @@ def cmd_pane(which):
         if bp:
             tmux(["select-pane", "-t", bp])
     elif which == "claude":
-        cp = find_pane(win, CLAUDE_PANE_TITLE)
-        if cp:
-            tmux(["select-pane", "-t", cp])
+        # 多切分时循环到下一个 claude pane;无切分则聚焦唯一一个
+        panes = _claude_panes_in_win(win)
+        if not panes:
+            cp = find_pane(win, CLAUDE_PANE_TITLE)
+            if cp:
+                tmux(["select-pane", "-t", cp])
+            return 0
+        rc, out, _ = tmux(["display-message", "-p", "#{pane_id}"])
+        cur = out.strip() if rc == 0 else None
+        nxt = panes[(panes.index(cur) + 1) % len(panes)] if cur in panes else panes[0]
+        tmux(["select-pane", "-t", nxt])
     elif which == "services":
         sp = find_pane(win, SERVICES_PANE_TITLE) or create_services_pane(win)
         if sp:
@@ -711,6 +1297,20 @@ def _init_colors():
     curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)  # 选中高亮条
     curses.init_pair(7, curses.COLOR_RED, bg)                    # failed
     curses.init_pair(8, curses.COLOR_MAGENTA, bg)                # 标题点缀
+    # 8 色调色板(给钉选圆点用,与 pane 边框 @cwtint 同色);pair 10..17
+    for i, cid in enumerate(_TINT_COLOR_IDS):
+        try:
+            curses.init_pair(10 + i, cid, bg)
+        except Exception:
+            pass
+
+
+def tint_pair_for_sid8(sid8):
+    """sid8 -> 对应的 curses color_pair(与 pane @cwtint 同色)。"""
+    try:
+        return curses.color_pair(10 + (int(sid8, 16) % len(_TINT_COLOR_IDS)))
+    except (ValueError, TypeError):
+        return curses.color_pair(10)
 
 
 # 状态 -> (字形, 颜色 pair)。dot 按状态着色,比按分组更直观。
@@ -774,6 +1374,7 @@ def _build_rows(state):
     选中用 sel_id(('card',sid) 或 ('proj',pkey))持久,切视图/折叠都不丢。"""
     view = state.get("view", "project")
     cards = state["cards"]
+    pinned = state.get("pinned") or set()
     rows = []
     if view == "project":
         projs = {}
@@ -803,7 +1404,8 @@ def _build_rows(state):
             if not collapsed:
                 for c in sorted(items, key=_card_sort_key):
                     rows.append({"t": "card", "id": ("card", c["sid"]), "card": c,
-                                 "indent": True, "show_proj": False})
+                                 "indent": True, "show_proj": False,
+                                 "pinned": c.get("sid8") in pinned})
             rows.append({"t": "spacer"})
     else:  # status 视图:一级是状态组,卡片显示项目名
         for gkey, gname, gcol in GROUPS:
@@ -814,7 +1416,8 @@ def _build_rows(state):
                          "gcol": gcol, "n": len(items)})
             for c in sorted(items, key=lambda c: -_card_recency(c)):
                 rows.append({"t": "card", "id": ("card", c["sid"]), "card": c,
-                             "indent": False, "show_proj": True})
+                             "indent": False, "show_proj": True,
+                             "pinned": c.get("sid8") in pinned})
             rows.append({"t": "spacer"})
     state["rows"] = rows
     state["sel_rows"] = [i for i, r in enumerate(rows) if r["t"] in ("card", "phdr")]
@@ -920,9 +1523,9 @@ def _draw(stdscr, state):
         x = _put(stdscr, 0, x, chip + "  ", w,
                  curses.color_pair(gcol) | (curses.A_BOLD if counts.get(gkey) else curses.A_DIM))
     if narrow:
-        hint = "j/k ⏎切 g视图 ␣折叠 n新 q→"
+        hint = "j/k ⏎切 g视图 ␣折叠 n新 q→  点●钉入中间"
     else:
-        hint = "j/k·滚轮 移动   ⏎/点 切换·折叠   g 项目/状态   ␣ 折叠   n 新建   q →会话"
+        hint = "点 ● 钉入/取消中间并排   j/k·滚轮 移动   ⏎/点卡片 切换·折叠   g 项目/状态   n 新建   q →会话"
     _put(stdscr, 1, 0, hint, w, curses.A_DIM)
 
     # ---- rows 绘制 ----
@@ -988,11 +1591,18 @@ def _draw_card_row(stdscr, row, r, w, selected, narrow):
             stdscr.addnstr(row, 0, " " * w, w, base)
         except curses.error:
             pass
+    # col 0 钉子圆点:已钉=彩色●(颜色对应该 pane),未钉=暗○。点它=钉进/取消中间并排。
+    is_pinned = r.get("pinned") and c.get("sid8")
+    if is_pinned:
+        dot, dot_attr = "●", tint_pair_for_sid8(c["sid8"]) | curses.A_BOLD
+    else:
+        dot, dot_attr = "○", curses.A_DIM
+    x = _put(stdscr, row, 0, dot, w, dot_attr)
     glyph, gc = _status_glyph(c)
     ag = age_str(_card_recency(c))
     indent = "    " if r.get("indent") else " "
     mark = "▸" if selected else " "
-    x = _put(stdscr, row, 0, indent[:-1] + mark + " ", w, base)
+    x = _put(stdscr, row, x, indent[:-1] + mark + " ", w, base)
     x = _put(stdscr, row, x, glyph, w, base if selected else (curses.color_pair(gc) | curses.A_BOLD))
     x = _put(stdscr, row, x, " ", w, base)
     cfg = c.get("config")
@@ -1108,12 +1718,21 @@ def _activate(state, stdscr):
         state["msg"] = "demo 模式 —— 跑 `cw up` 进入真实会话"
         return False
     c = r["card"]
-    if c["managed"] and c["win"]:
-        win = "%s:%s" % (SESSION_NAME, c["win"])
-        tmux(["select-window", "-t", win])
-        cp = find_pane(win, CLAUDE_PANE_TITLE)
-        if cp:
-            tmux(["select-pane", "-t", cp])
+    if c["managed"]:
+        # 按 sid8 精确定位 live pane(一个窗口可能并排多个切分)
+        loc = managed_panes().get(c["sid8"])
+        if loc:
+            tmux(["select-window", "-t", loc["wid"]])
+            tmux(["select-pane", "-t", loc["pane"]])
+            return False
+        # managed 但 pane 已不在(刚退出?)-> 回退到窗口名
+        if c.get("win"):
+            tmux(["select-window", "-t", "%s:%s" % (SESSION_NAME, c["win"])])
+            cp = find_pane("%s:%s" % (SESSION_NAME, c["win"]), CLAUDE_PANE_TITLE)
+            if cp:
+                tmux(["select-pane", "-t", cp])
+            return False
+        state["msg"] = "%s 已不在活动窗格" % c.get("sid8")
         return False
     if c["group"] == "external" and c.get("sid"):
         # 导入并切换(带上该会话所属配置,避免切错模型)
@@ -1218,8 +1837,10 @@ def _board_main(stdscr, demo=False):
     state = {"cards": (demo_cards() if demo else gather_cards()),
              "view": "project", "folds": {}, "rows": [], "sel_rows": [],
              "sel_row": None, "sel_id": None, "msg": "", "demo": demo,
-             "row_map": {}, "last_click": (None, 0.0)}
+             "row_map": {}, "last_click": (None, 0.0), "pinned": set()}
     while True:
+        if not demo:
+            state["pinned"] = pinned_sid8s(current_window())
         _build_rows(state)
         try:
             _draw(stdscr, state)
@@ -1271,6 +1892,51 @@ def _board_main(stdscr, demo=False):
                 _activate(state, stdscr)
             else:
                 state["msg"] = "选中一个 EXTERNAL 会话再用 i 导入"
+        elif ch == ord("v"):
+            c = _sel_card(state)
+            if not c:
+                state["msg"] = "先选中一个会话卡片"
+            elif state.get("demo"):
+                state["msg"] = "demo 模式 -- 跑 `cw up` 进入真实会话"
+            elif not c.get("sid"):
+                state["msg"] = "该卡片没有 sid"
+            else:
+                ok, msg = pin_session(c["sid"], cwd=c.get("cwd"), base=c.get("source"))
+                state["msg"] = msg
+                if ok:
+                    state["cards"] = gather_cards()
+        elif ch == ord("V"):
+            c = _sel_card(state)
+            if not c:
+                state["msg"] = "先选中一个会话卡片"
+            elif state.get("demo"):
+                state["msg"] = "demo 模式 -- 跑 `cw up` 进入真实会话"
+            elif not c.get("sid8"):
+                state["msg"] = "该卡片没有 sid"
+            else:
+                ok, msg = unpin_session(c["sid8"])
+                state["msg"] = msg
+                if ok:
+                    state["cards"] = gather_cards()
+
+
+def _toggle_pin(state, c):
+    """点卡片圆点:已钉->取消;未钉->钉进当前窗口中间并排。"""
+    if state.get("demo"):
+        state["msg"] = "demo 模式 -- 跑 `cw up` 进入真实会话"
+        return
+    if not c.get("sid"):
+        state["msg"] = "该卡片没有 sid"
+        return
+    sid8 = c.get("sid8")
+    if sid8 and sid8 in (state.get("pinned") or set()):
+        ok, msg = unpin_session(sid8)
+    else:
+        ok, msg = pin_session(c["sid"], cwd=c.get("cwd"), base=c.get("source"))
+    state["msg"] = msg
+    if ok:
+        state["cards"] = gather_cards()
+        state["pinned"] = pinned_sid8s(current_window())
 
 
 def _handle_mouse(state, stdscr):
@@ -1301,6 +1967,10 @@ def _handle_mouse(state, stdscr):
     last_id, last_t = state.get("last_click", (None, 0.0))
     is_double = bool(bstate & dbl) or (last_id == rid and (now - last_t) < 0.4)
     state["last_click"] = (rid, now)
+    # 点卡片的钉子圆点(col 0):直接钉进/取消中间并排,不走选择/切换
+    if row["t"] == "card" and mx <= 1:
+        _toggle_pin(state, row["card"])
+        return
     # 点项目头:直接折叠展开;点卡片:选中,再点/双击才打开
     state["sel_row"] = ri
     state["sel_id"] = rid
@@ -1320,49 +1990,168 @@ def cmd_board(demo=False):
 
 
 # --------------------------------------------------------------------------
-# 服务面板 TUI(右侧窄栏,显示运行中的会话/任务)
+# 服务面板 TUI(右侧窄栏:port-project 监听列表)
 # --------------------------------------------------------------------------
 
+# 跨窗格/跨窗口共享的视图模式(文件存盘,g 热键与面板内切换共用)
+SERVICES_MODE_FILE = expand("~/.cw_services_mode")
+
+
+def load_services_mode():
+    """返回 'project' 或 'all'。"""
+    try:
+        with open(SERVICES_MODE_FILE) as f:
+            m = f.read().strip()
+        if m in ("project", "all"):
+            return m
+    except Exception:
+        pass
+    return "project"
+
+
+def save_services_mode(mode):
+    if mode not in ("project", "all"):
+        return
+    try:
+        with open(SERVICES_MODE_FILE, "w") as f:
+            f.write(mode + "\n")
+    except Exception:
+        pass
+
+
+def toggle_services_mode():
+    """project ↔ all,返回新模式。"""
+    m = "all" if load_services_mode() == "project" else "project"
+    save_services_mode(m)
+    return m
+
+
+def respawn_services_panes():
+    """让所有已存在的服务窗格重新加载 cw.py services(代码更新后用)。"""
+    rc, out, _ = tmux(["list-panes", "-t", SESSION_NAME, "-a",
+                       "-F", "#{pane_title}\t#{pane_id}"])
+    if rc != 0 or not out.strip():
+        return 0
+    n = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and SERVICES_PANE_TITLE in parts[0]:
+            tmux(["respawn-pane", "-k", "-t", parts[1], _services_cmd()])
+            n += 1
+    return n
+
+
+def respawn_board_panes():
+    """让所有已存在的看板窗格重新加载 cw.py board(代码更新后吃到新热键/逻辑)。"""
+    rc, out, _ = tmux(["list-panes", "-t", SESSION_NAME, "-a",
+                       "-F", "#{pane_title}\t#{pane_id}"])
+    if rc != 0 or not out.strip():
+        return 0
+    n = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and parts[0] == BOARD_PANE_TITLE:
+            tmux(["respawn-pane", "-k", "-t", parts[1], _board_cmd()])
+            n += 1
+    return n
+
+
 def _services_main(stdscr):
-    """服务面板:显示所有活跃的会话和后台任务,紧凑列表。"""
+    """服务面板:以 port-project 展示监听中的 backend。
+
+    两种视图(g / Tab / Ctrl-b g 切换,状态写 ~/.cw_services_mode):
+      project — 仅 cwd 属于 Claude 会话项目的端口
+      all     — 本机用户相关监听端口
+    """
     _init_colors()
     curses.curs_set(0)
-    curses.halfdelay(30)  # 3s 超时 -> 自动刷新
+    curses.halfdelay(20)  # 2s 超时 -> 自动刷新 + 读模式文件
+    scroll = 0
+    last_mode = None
+    ports = []
     while True:
-        cards = gather_cards()
-        # 只保留活跃的(非 done)
-        active = [c for c in cards if c["group"] != "done"]
+        mode = load_services_mode()
+        if mode != last_mode:
+            scroll = 0
+            last_mode = mode
+            ports = list_listening_ports(mode)
+        else:
+            # 定时刷新列表
+            ports = list_listening_ports(mode)
+
         h, w = stdscr.getmaxyx()
         stdscr.erase()
-        # 标题
-        _put(stdscr, 0, 0, "服务", w, curses.color_pair(8) | curses.A_BOLD)
-        count_text = "%d 活跃" % len(active)
-        _put(stdscr, 0, 6, count_text, w, curses.A_DIM)
-        # 分隔线
+        # 标题行整串写入(中文双宽,避免链式 x 错位)
+        mode_tag = "项目" if mode == "project" else "全机"
+        title = "端口[%s] %d" % (mode_tag, len(ports))
+        title_col = curses.color_pair(5 if mode == "project" else 3) | curses.A_BOLD
+        _put(stdscr, 0, 0, _truncate(title, w), w, title_col)
         _put(stdscr, 1, 0, "─" * w, w, curses.A_DIM)
-        # 列表
-        row = 2
-        for c in active[:h - 4]:  # 留几行底部空间
-            glyph, gc = _status_glyph(c)
-            proj = _truncate(projshort(c.get("cwd")), 10)
-            title = _truncate(c.get("title") or c.get("name"), w - 14)
-            cfg = c.get("config")
-            cfg_tag = "[%s] " % cfg if cfg and cfg != "default" else ""
-            line = "%s%s %s" % (cfg_tag, proj, title)
-            _put(stdscr, row, 0, glyph, w, curses.color_pair(gc) | curses.A_BOLD)
-            _put(stdscr, row, 2, _truncate(line, w - 2), w, curses.A_DIM)
-            row += 1
-        if not active:
-            _put(stdscr, 3, 0, "(无活跃服务)", w, curses.A_DIM)
-        stdscr.refresh()
+        # 提示(极窄时省略)
+        if h > 4 and w >= 18:
+            _put(stdscr, h - 1, 0, _truncate("g切换 r刷新 q回", w), w, curses.A_DIM)
+
+        body_top, body_bot = 2, max(2, h - 2)
+        body_h = max(0, body_bot - body_top)
+        if body_h <= 0:
+            stdscr.refresh()
+        else:
+            if not ports:
+                msg = "(无项目端口)" if mode == "project" else "(无监听端口)"
+                _put(stdscr, body_top, 0, msg, w, curses.A_DIM)
+            else:
+                max_scroll = max(0, len(ports) - body_h)
+                scroll = max(0, min(scroll, max_scroll))
+                visible = ports[scroll:scroll + body_h]
+                for i, p in enumerate(visible):
+                    # 主行: port-project  (窄栏优先完整 label)
+                    label = p["label"]
+                    # 副信息: 进程名缩写,空间够才显示
+                    cmd = p.get("cmd") or ""
+                    line = label
+                    if w >= 28 and cmd and cmd != p.get("project"):
+                        rest = w - len(label) - 2
+                        if rest > 3:
+                            line = "%s %s" % (label, _truncate(cmd, rest))
+                    col = (curses.color_pair(2) if p.get("in_claude")
+                           else curses.A_DIM)
+                    _put(stdscr, body_top + i, 0, _truncate(line, w), w, col)
+                # 滚动指示
+                if scroll > 0:
+                    _put(stdscr, body_top, max(0, w - 1), "↑", w, curses.A_DIM)
+                if scroll + body_h < len(ports):
+                    _put(stdscr, body_bot - 1, max(0, w - 1), "↓", w, curses.A_DIM)
+            stdscr.refresh()
+
         ch = stdscr.getch()
         if ch in (ord("q"),):
-            # q: 聚焦回会话窗格
             cp = find_pane(current_window(), CLAUDE_PANE_TITLE)
             if cp:
                 tmux(["select-pane", "-t", cp])
             else:
                 break
+        elif ch in (ord("g"), ord("G"), 9):  # g / Tab
+            toggle_services_mode()
+            # last_mode 会在下轮检测变化
+        elif ch in (ord("a"),):
+            save_services_mode("all")
+        elif ch in (ord("p"),):
+            save_services_mode("project")
+        elif ch in (ord("r"), ord("R")):
+            last_mode = None  # 强制重扫
+        elif ch in (curses.KEY_UP, ord("k")):
+            scroll = max(0, scroll - 1)
+        elif ch in (curses.KEY_DOWN, ord("j")):
+            scroll += 1
+        elif ch in (curses.KEY_PPAGE,):
+            scroll = max(0, scroll - max(1, body_h))
+        elif ch in (curses.KEY_NPAGE,):
+            scroll += max(1, body_h)
+        elif ch == curses.KEY_HOME:
+            scroll = 0
+        elif ch == curses.KEY_END:
+            scroll = max(0, len(ports) - 1)
+        # halfdelay 超时 ch == -1: 自然刷新
 
 
 def cmd_services():
@@ -1371,6 +2160,15 @@ def cmd_services():
     except curses.error as e:
         print("curses 错误(终端太小?): %s" % e, file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_services_toggle():
+    """供 Ctrl-b g 调用:切换项目/全机模式(服务面板下轮自动跟上)。"""
+    m = toggle_services_mode()
+    # 尽量给一个瞬时 tmux 状态提示
+    label = "项目端口" if m == "project" else "全机端口"
+    tmux(["display-message", "cw services: %s" % label])
     return 0
 
 
@@ -1581,7 +2379,61 @@ def _hud_show_session(app_name="Terminal"):
             pass
 
 
+def _hud_running_pids():
+    """其它已在跑的 `cw.py hud` 进程 pid 列表(不含自己)。"""
+    me = os.getpid()
+    pids = []
+    try:
+        r = subprocess.run(["ps", "-ax", "-o", "pid=,command="],
+                           capture_output=True, text=True, timeout=2)
+    except Exception:
+        return pids
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 匹配: python …/cw.py hud  或  …/cw.py hud
+        if "cw.py" not in line and SCRIPT not in line:
+            continue
+        # 命令行末尾或中间有 hud 子命令
+        if not re.search(r"\bhud\b", line):
+            continue
+        try:
+            p = int(line.split(None, 1)[0])
+        except (ValueError, IndexError):
+            continue
+        if p != me:
+            pids.append(p)
+    return pids
+
+
+def _activate_pid(pid):
+    """把指定 unix pid 的进程窗口置前(macOS)。"""
+    script = (
+        'tell application "System Events"\n'
+        '  try\n'
+        '    set frontmost of first process whose unix id is %d to true\n'
+        '  end try\n'
+        'end tell' % int(pid)
+    )
+    try:
+        subprocess.run(["osascript", "-e", script],
+                       capture_output=True, timeout=3)
+        return True
+    except Exception:
+        return False
+
+
 def cmd_hud(config=None):
+    # 已有实例:只聚焦,不重复拉起(Ctrl-b h = 打开钉看板)
+    existing = _hud_running_pids()
+    if existing:
+        ok = _activate_pid(existing[0])
+        if ok:
+            print("钉看板已在运行,已置前 (pid %d)" % existing[0])
+            return 0
+        # 置前失败仍继续启动新实例
+
     try:
         import objc  # noqa: F401
         from AppKit import (
@@ -1942,8 +2794,14 @@ def main():
     p_imp.add_argument("sid")
     p_pane = sub.add_parser("pane", help="聚焦/召出当前窗口的窗格(board|claude|services)")
     p_pane.add_argument("which", choices=["board", "claude", "services"])
-    sub.add_parser("hud", help="macOS 原生悬浮看板(置顶浮窗,需 PyObjC)")
-    sub.add_parser("services", help="运行服务面板 TUI(右侧窄栏)")
+    sub.add_parser("hud", help="macOS 原生悬浮看板/钉看板(置顶浮窗,需 PyObjC)")
+    sub.add_parser("services", help="运行服务面板 TUI(右侧窄栏:port-project)")
+    sub.add_parser("services-toggle",
+                   help="切换服务面板 项目端口/全机端口(Ctrl-b g 内部用)")
+    p_pin = sub.add_parser("pin", help="把 session 钉到当前窗口会话区并排(切分/resume/并入)")
+    p_pin.add_argument("sid")
+    p_unpin = sub.add_parser("unpin", help="取消钉选(参数为 sid8 或 current)")
+    p_unpin.add_argument("target")
     args = ap.parse_args()
     cmd = args.cmd or "up"
     if cmd == "up":
@@ -1964,6 +2822,16 @@ def main():
         return cmd_hud()
     if cmd == "services":
         return cmd_services()
+    if cmd == "services-toggle":
+        return cmd_services_toggle()
+    if cmd == "pin":
+        ok, msg = pin_session(args.sid)
+        print(msg)
+        return 0 if ok else 1
+    if cmd == "unpin":
+        ok, msg = unpin_session(args.target)
+        print(msg)
+        return 0 if ok else 1
     ap.print_help()
     return 1
 

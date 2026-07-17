@@ -7,15 +7,15 @@
 `claudemux` (command: `cw`) gathers every Claude Code session you have running
 into one tmux session. Each session lives in a window split
 `[ board 30% │ conversation 55% │ services 15% ]` — the board stays visible on the
-left, your conversation in the middle, and a compact list of active sessions on
-the right. You always know which session is busy, idle, blocked on a question, or
-done, and can jump between them without ever leaving tmux.
+left, your conversation in the middle, and listening backends as `port-project`
+on the right. You always know which session is busy, idle, blocked on a question,
+or done — and which local ports each project is serving — without leaving tmux.
 
 ![claudemux terminal layout](assets/terminal-screen.png)
 
 **Three-pane terminal layout** — the board (left) shows every session's status at
 a glance, the conversation (center) is where you talk to Claude, and the services
-panel (right) lists all active sessions and background tasks in a compact scroll.
+panel (right) lists listening ports as `port-project-name` (project or all-machine).
 
 ![claudemux floating HUD](assets/4cf946af-b7a6-4f06-bf7a-221f37167242.png)
 
@@ -39,6 +39,8 @@ stays front and center, because the terminal is where the real work happens.
 - **Three-pane layout** — board (30%), conversation (55%), services panel (15%).
   The board and services stay visible in every window; only the keyboard focus
   moves between them.
+- **Port radar** — right pane shows live backends as `port-project-name`, with a
+  one-key toggle between Claude-project ports and all machine ports.
 - **Instant switching** — select a card, land in that conversation. The board
   stays put on the left, so you never lose the overview.
 - **Import existing sessions** — `claude --resume <sid>` pulls a bare-terminal
@@ -77,13 +79,33 @@ cw up        # create/attach the tmux session, bind hotkeys, and auto-launch HUD
 Then, anywhere inside the `cw` session:
 
 - `Ctrl-b b` — focus / summon the board pane (the left panel)
-- `Ctrl-b B` — focus the conversation pane (the center panel)
+- `Ctrl-b B` — focus the conversation pane (cycles to the next split when several are pinned)
 - `Ctrl-b s` — focus the services pane (the right panel)
-- `Ctrl-b h` — launch / focus the floating HUD panel
+- `Ctrl-b g` — toggle services view: **project ports** ↔ **all machine ports**
+- `Ctrl-b h` — launch / focus the floating HUD ("钉看板")
 - `Ctrl-b ←` / `Ctrl-b →` — move focus between panes (tmux default)
 - `Ctrl-b z` — zoom the active pane to full width, again to restore
 - `Ctrl-b N` — new Claude in a project (prompts for cwd)
+- `Ctrl-b V` - unpin the conversation pane currently in focus
 
+### Pinning multiple conversations side-by-side (y-axis split)
+
+The center conversation area can be split into several side-by-side panes, each
+running a different live session, so you can watch several at once. Switch focus
+(`Ctrl-b B` cycles, or click) to type into any of them. Each pane gets a stable
+color bar (derived from its session id) for at-a-glance distinction.
+
+- (in the board) **click the dot** at the start of a card row to toggle pin:
+  empty dot = not pinned, filled colored dot = pinned in the current window's center.
+  Clicking pins the session into a side-by-side pane (not live -> split +
+  `claude --resume`; live in another window -> closed there and resumed here;
+  already here -> just focus it); clicking a pinned dot unpins (closes the pane,
+  session stays on disk). The dot's color matches the pane's color bar.
+- Keyboard aliases: `v` = pin selected card, `V` = unpin selected.
+- `Ctrl-b V` - unpin whatever conversation pane currently has focus
+
+One session id is live in at most one pane globally, so pinning never double-opens
+a session. Panes auto-balance to equal width; beyond ~3 the columns get narrow.
 ## The board
 
 The board is the left 30% of every window; the conversation takes the center 55%;
@@ -142,14 +164,28 @@ a summary of every session in that project.
 
 ## Services panel
 
-The services panel is a narrow column on the right side (15% of window width) that
-shows a compact list of all active (non-done) sessions and background tasks. It
-runs as a separate TUI (`cw services`) and displays each entry with its status
-glyph, project name, session title, and config tag.
+The services panel is a narrow column on the right side (~15% of window width)
+that lists **listening TCP backends** as `port-project-name` (e.g.
+`7077-screen_points_server`). It runs as `cw services` and auto-refreshes.
 
-Unlike the board, the services panel is **read-only** — it's designed to be a
-glanceable status strip that stays visible while you work in the conversation pane.
-Press `q` inside the services panel to return focus to the conversation.
+Two views (shared across all windows via `~/.cw_services_mode`):
+
+| View | What it shows |
+|---|---|
+| **project** (default) | Ports whose process cwd sits under a live Claude session project — the backends Claude likely started |
+| **all** | All user-level listening ports on the machine (system daemons like ControlCenter/rapportd are hidden) |
+
+Toggle with **`Ctrl-b g`** from anywhere in the session, or inside the panel:
+
+| Key | Action |
+|---|---|
+| `g` / `Tab` | project ↔ all |
+| `p` / `a` | jump to project / all |
+| `↑` `↓` / `j` `k` | scroll |
+| `r` | refresh now |
+| `q` | focus the conversation pane |
+
+The panel is glanceable and stays visible while you work in the conversation.
 
 ## Floating HUD (macOS)
 
@@ -187,11 +223,14 @@ Interactions:
 cw                         create/attach tmux session + bind keys (default)
 cw up                      same as above (also auto-launches HUD)
 cw board                   run the board TUI directly
-cw services                run the services panel TUI (right-side narrow strip)
+cw services                run the services panel TUI (port-project list)
+cw services-toggle         flip project ports ↔ all ports (Ctrl-b g)
 cw launch <cwd> [prompt] [--config doubao|official]   open a new Claude window in <cwd>
 cw import <sid>            import an existing session via claude --resume
+cw pin <sid>              pin a session into the current window's center (split/resume)
+cw unpin <sid8|current>   unpin a session (by sid8, or 'current' for the focused pane)
 cw pane board|claude|services   focus/summon a specific pane in the current window
-cw hud                     floating macOS overview panel (needs PyObjC)
+cw hud                     floating macOS "钉看板" panel (needs PyObjC; focuses if already open)
 cw list [--by project|status]  print the board as plain text (no TUI)
 cw status                  print discovered sessions/jobs as JSON
 ```
@@ -223,20 +262,20 @@ importing or replying to a session never switches you to the wrong model.
 you pick the config when more than one profile exists.
 
 ```
-   ┌─────────────────── tmux session "cw" ───────────────────┐
-   │  every window:  [ board 30% │ conversation 55% │ services 15% ] │
-   │                                                          │
-   │  win api-server-3a305475                                 │
-   │   ┌─board─────┬─conversation──────────┬─services──┐      │
-   │   │RUNNING (1)│ $ claude               │ ○ mouse-  │      │
-   │   │▸ ● api-srv│ > deploying to…        │   control │      │
-   │   │WAITING (1)│                        │ ● claude- │      │
-   │   │  ? web-app│                        │   wekan   │      │
-   │   └───────────┴───────────────────────────────────┘      │
-   │  win web-app-0702e324    win docs-4966e175    …            │
-   │   ▲ pick a card on the left → switch window                │
-   │     board + services stay visible in every window           │
-   └────────────────────────────────────────────────────────────┘
+   ┌─────────────────── tmux session "cw" ──────────────────────┐
+   │  every window:  [ board 30% │ conversation 55% │ ports 15% ] │
+   │                                                             │
+   │  win api-server-3a305475                                    │
+   │   ┌─board─────┬─conversation──────────┬─ports────────┐      │
+   │   │RUNNING (1)│ $ claude               │端口[项目] 4  │      │
+   │   │▸ ● api-srv│ > deploying to…        │7077-api-srv  │      │
+   │   │WAITING (1)│                        │3000-web-app  │      │
+   │   │  ? web-app│                        │5173-web-app  │      │
+   │   └───────────┴────────────────────────┴──────────────┘      │
+   │  win web-app-0702e324    win docs-4966e175    …             │
+   │   ▲ pick a card on the left → switch window                 │
+   │     board + ports stay visible; Ctrl-b g toggles all/proj   │
+   └─────────────────────────────────────────────────────────────┘
 ```
 
 ## Limitations
@@ -250,6 +289,16 @@ you pick the config when more than one profile exists.
 
 ## Troubleshooting
 
+- **Clicking the pin dot / `v` just flashes, no pane appears** - `claude --resume`
+  exited instantly, usually because `claude` isn't on PATH (a recent reinstall can
+  leave only `claude.exe` with no symlink). `cw` auto-resolves the binary via
+  `_claude_bin()` (PATH, then `claude.exe`, `~/.claude/local/claude`, npm global);
+  check with `python3 -c "import cw;print(cw._claude_bin())"`. Re-run `cw up` after
+  upgrading so the board picks up the fix.
+- **The pin dot doesn't show / clicking it does nothing** - the board pane is old code;
+  re-run `cw up` (respawns the board). Confirm `tmux show-option -t cw mouse` is `on`.
+- **Pinning the current window's own session doesn't split** - correct, it's already
+  here; select a *different* session's card and click its dot to split.
 - **`Ctrl-b b` does nothing** — re-run `cw up` (it re-binds the key in the tmux
   prefix table). Run `tmux list-keys -T prefix | grep cw.py` to verify.
 - **No board pane in this window** — `Ctrl-b b` creates one on the left if
